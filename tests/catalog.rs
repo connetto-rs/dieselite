@@ -1,6 +1,9 @@
 //! Reads every catalog relation of a database built from a fixed DDL corpus.
 
-use diesel::{connection::SimpleConnection, prelude::*, sql_types::Text, sqlite::SqliteConnection};
+use diesel::{
+    ConnectionError, ConnectionResult, connection::SimpleConnection, prelude::*, sql_types::Text,
+    sqlite::SqliteConnection,
+};
 use dieselite::{
     models::{
         AttachedDatabase, Collation, ForeignKeyColumn, FunctionSignature, IndexColumn,
@@ -40,11 +43,11 @@ diesel::define_sql_function! {
     fn shout(text: Text) -> Text;
 }
 
-fn corpus() -> SqliteConnection {
-    let mut connection =
-        SqliteConnection::establish(":memory:").expect("an in-memory database opens");
-    connection.batch_execute(CORPUS).expect("the corpus is valid SQLite DDL");
-    connection
+/// Opens an in-memory database holding [`CORPUS`].
+fn corpus() -> ConnectionResult<SqliteConnection> {
+    let mut connection = SqliteConnection::establish(":memory:")?;
+    connection.batch_execute(CORPUS).map_err(ConnectionError::CouldntSetupConfiguration)?;
+    Ok(connection)
 }
 
 fn table_column(
@@ -80,7 +83,7 @@ fn index_column(
 
 #[test]
 fn schema_objects_keep_the_stored_ddl() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let objects: Vec<SchemaObject> = sqlite_schema::table
         .select(SchemaObject::as_select())
         .order_by(sqlite_schema::name)
@@ -124,7 +127,7 @@ fn schema_objects_keep_the_stored_ddl() {
 
 #[test]
 fn table_list_classifies_every_schema_object() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let tables: Vec<TableListEntry> = pragma_table_list::table
         .select(TableListEntry::as_select())
         .order_by((pragma_table_list::schema, pragma_table_list::name))
@@ -168,7 +171,7 @@ fn table_list_classifies_every_schema_object() {
 
 #[test]
 fn table_columns_join_through_the_hidden_argument() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let columns: Vec<(String, TableColumn)> = sqlite_schema::table
         .inner_join(pragma_table_xinfo::table.on(pragma_table_xinfo::arg.eq(sqlite_schema::name)))
         .filter(sqlite_schema::name.eq_any(["child", "pair"]))
@@ -197,7 +200,7 @@ fn table_columns_join_through_the_hidden_argument() {
 
 #[test]
 fn table_columns_of_an_attached_database_are_read_through_the_hidden_schema() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let columns: Vec<TableColumn> = pragma_table_xinfo::table
         .filter(pragma_table_xinfo::arg.eq("other"))
         .filter(pragma_table_xinfo::schema.eq("aux"))
@@ -210,7 +213,7 @@ fn table_columns_of_an_attached_database_are_read_through_the_hidden_schema() {
 
 #[test]
 fn foreign_keys_report_actions_and_an_implicit_target_column() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let foreign_keys: Vec<ForeignKeyColumn> = pragma_foreign_key_list::table
         .filter(pragma_foreign_key_list::arg.eq("child"))
         .select(ForeignKeyColumn::as_select())
@@ -247,7 +250,7 @@ fn foreign_keys_report_actions_and_an_implicit_target_column() {
 
 #[test]
 fn index_columns_include_expressions_and_auxiliary_rowids() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let columns: Vec<(IndexListEntry, IndexColumn)> = pragma_index_list::table
         .inner_join(
             pragma_index_xinfo::table.on(pragma_index_xinfo::arg.eq(pragma_index_list::name)),
@@ -285,7 +288,7 @@ fn index_columns_include_expressions_and_auxiliary_rowids() {
 
 #[test]
 fn partial_descending_index_is_reported_as_such() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let indexes: Vec<IndexListEntry> = pragma_index_list::table
         .filter(pragma_index_list::arg.eq("child"))
         .select(IndexListEntry::as_select())
@@ -319,7 +322,7 @@ fn partial_descending_index_is_reported_as_such() {
 
 #[test]
 fn database_list_names_main_temp_and_attached_databases() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let databases: Vec<AttachedDatabase> = pragma_database_list::table
         .select(AttachedDatabase::as_select())
         .order_by(pragma_database_list::seq)
@@ -333,7 +336,7 @@ fn database_list_names_main_temp_and_attached_databases() {
 
 #[test]
 fn function_list_tells_application_functions_from_built_in_ones() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     shout_utils::register_impl(&mut connection, |text: String| text.to_uppercase())
         .expect("the application function registers");
     let functions: Vec<FunctionSignature> = pragma_function_list::table
@@ -360,7 +363,7 @@ fn function_list_tells_application_functions_from_built_in_ones() {
 
 #[test]
 fn collation_list_includes_registered_collations() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     connection
         .register_collation("reverse", |left, right| right.cmp(left))
         .expect("the collation registers");
@@ -379,7 +382,7 @@ fn collation_list_includes_registered_collations() {
 
 #[test]
 fn module_list_includes_the_compiled_in_modules() {
-    let mut connection = corpus();
+    let mut connection = corpus().expect("the corpus database builds");
     let modules: Vec<VirtualTableModule> = pragma_module_list::table
         .filter(pragma_module_list::name.eq_any(["fts5", "rtree"]))
         .select(VirtualTableModule::as_select())
