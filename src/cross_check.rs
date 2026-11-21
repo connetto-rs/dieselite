@@ -215,6 +215,12 @@ fn check_columns(
             },
             column.generation_storage(database),
         )?;
+        equal(
+            relation,
+            "declared type",
+            Some(catalog_column.declared_type.as_str()),
+            answer(relation, "declared type", column.declared_type_text(database))?,
+        )?;
     }
     Ok(())
 }
@@ -584,6 +590,9 @@ mod tests {
     });
     mismatch_test!(generation_storage, "CREATE TABLE t(a INT AS (1) STORED)", "generated", rows, {
         rows.columns[0].hidden = 2;
+    });
+    mismatch_test!(declared_type, "CREATE TABLE t(a INT)", "declared type", rows, {
+        rows.columns[0].declared_type = "TEXT".to_owned();
     });
     mismatch_test!(foreign_key_count, "CREATE TABLE t(a INT)", "foreign key count", rows, {
         rows.foreign_keys.push(foreign_key());

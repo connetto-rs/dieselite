@@ -183,6 +183,13 @@ fn attached_and_temp_databases() {
 }
 
 #[test]
+fn declared_types_in_every_database() {
+    build(
+        "CREATE TABLE t(a int, b VARCHAR( 10 ), c \"my  Type\", d, e int(+5, 2)); ATTACH ':memory:' AS other; CREATE TABLE other.p(id integer, label nvarchar(+5)); CREATE TEMP TABLE temp_table(a Decimal(10, 2), b /* note */ TEXT); CREATE VIRTUAL TABLE docs USING fts5(body)",
+    ).expect("catalog agrees");
+}
+
+#[test]
 fn mixed_case_names() {
     use sql_traits::prelude::*;
     let database = build("CREATE TABLE \"Users\"(\"ID\" INT)").expect("catalog agrees");
