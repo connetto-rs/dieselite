@@ -45,12 +45,7 @@ impl TryFrom<DieseliteDatabaseBuilder<'_>> for ParserDB {
     /// cannot be read or disagrees.
     fn try_from(builder: DieseliteDatabaseBuilder<'_>) -> Result<Self, Self::Error> {
         let connection = builder.connection.ok_or(DieseliteBuildError::MissingConnection)?;
-        let version: String = diesel::select(sqlite_version()).get_result(connection)?;
-        let numbers = version.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
-        if !matches!(numbers.as_deref(), Ok([major, minor, patch]) if (*major, *minor, *patch) >= (3, 37, 0))
-        {
-            return Err(DieseliteBuildError::UnsupportedSqliteVersion { found: version });
-        }
+        check_version(diesel::select(sqlite_version()).get_result(connection)?)?;
         let databases = pragma_database_list::table
             .select(AttachedDatabase::as_select())
             .order(pragma_database_list::seq)
@@ -69,9 +64,7 @@ impl TryFrom<DieseliteDatabaseBuilder<'_>> for ParserDB {
                 database.file.replace('\'', "''"),
                 database.name.replace('"', "\"\"")
             );
-            input = input
-                .apply_statement(parse_one(&database.name, &database.name, &sql)?)
-                .map_err(|source| ingestion(&database.name, &database.name, source))?;
+            input = ingest(input, connection, &relations, &database.name, &database.name, &sql)?;
         }
         for database in databases
             .iter()
@@ -95,40 +88,7 @@ impl TryFrom<DieseliteDatabaseBuilder<'_>> for ParserDB {
                 .load::<(String, String, Option<String>)>(connection)?;
             for (_object_type, name, sql) in definitions {
                 let Some(sql) = sql.filter(|_| !internal(&name)) else { continue };
-                let mut statement = parse_one(&database.name, &name, &sql)?;
-                qualify(&mut statement, &database.name);
-                input = if matches!(statement, Statement::CreateVirtualTable { .. }) {
-                    let columns = pragma_table_xinfo::table
-                        .filter(pragma_table_xinfo::arg.eq(&name))
-                        .filter(pragma_table_xinfo::schema.eq(&database.name))
-                        .order(pragma_table_xinfo::cid)
-                        .select(TableColumn::as_select())
-                        .load::<TableColumn>(connection)?;
-                    let suffixes = relations
-                        .iter()
-                        .filter(|relation| {
-                            relation.schema == database.name && relation.table_type == "shadow"
-                        })
-                        .filter_map(|relation| relation.name.rsplit_once('_'))
-                        .filter(|(prefix, _)| prefix.eq_ignore_ascii_case(&name))
-                        .map(|(_, suffix)| suffix);
-                    input.apply_virtual_table(
-                        statement,
-                        DeclaredVirtualTable::new(
-                            columns.into_iter().map(|column| {
-                                DeclaredColumn::new(
-                                    column.name,
-                                    column.declared_type,
-                                    column.hidden == 1,
-                                )
-                            }),
-                            suffixes,
-                        ),
-                    )
-                } else {
-                    input.apply_statement(statement)
-                }
-                .map_err(|source| ingestion(&database.name, &name, source))?;
+                input = ingest(input, connection, &relations, &database.name, &name, &sql)?;
             }
         }
         let database = input.finish();
@@ -138,12 +98,73 @@ impl TryFrom<DieseliteDatabaseBuilder<'_>> for ParserDB {
     }
 }
 
-fn ingestion(database: &str, name: &str, source: sql_traits::errors::Error) -> DieseliteBuildError {
-    DieseliteBuildError::Ingestion {
-        database: database.to_owned(),
-        name: name.to_owned(),
-        source: Box::new(source),
+/// Refuses a SQLite older than 3.37.0, the first release with
+/// `pragma_table_list`.
+fn check_version(version: String) -> Result<(), DieseliteBuildError> {
+    let numbers = version.split('.').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+    if matches!(numbers.as_deref(), Ok([major, minor, patch]) if (*major, *minor, *patch) >= (3, 37, 0))
+    {
+        Ok(())
+    } else {
+        Err(DieseliteBuildError::UnsupportedSqliteVersion { found: version })
     }
+}
+
+/// Parses the stored definition `sql` of `name` in `database`, names the
+/// object it creates under `database`, and applies it to `input`. A virtual
+/// table goes in with the columns and shadow tables `connection` reports for
+/// it.
+fn ingest(
+    input: ParserDBIngestor,
+    connection: &mut SqliteConnection,
+    relations: &[TableListEntry],
+    database: &str,
+    name: &str,
+    sql: &str,
+) -> Result<ParserDBIngestor, DieseliteBuildError> {
+    let mut statement = parse_one(database, name, sql)?;
+    qualify(&mut statement, database);
+    let applied = if matches!(statement, Statement::CreateVirtualTable { .. }) {
+        let declared = declared_virtual_table(connection, relations, database, name)?;
+        input.apply_virtual_table(statement, declared)
+    } else {
+        input.apply_statement(statement)
+    };
+    applied.map_err(|source| {
+        DieseliteBuildError::Ingestion {
+            database: database.to_owned(),
+            name: name.to_owned(),
+            source: Box::new(source),
+        }
+    })
+}
+
+/// Reads the columns SQLite declares for the virtual table `name` in
+/// `database`, and the suffixes of its shadow tables among `relations`.
+fn declared_virtual_table(
+    connection: &mut SqliteConnection,
+    relations: &[TableListEntry],
+    database: &str,
+    name: &str,
+) -> Result<DeclaredVirtualTable, diesel::result::Error> {
+    let columns = pragma_table_xinfo::table
+        .filter(pragma_table_xinfo::arg.eq(name))
+        .filter(pragma_table_xinfo::schema.eq(database))
+        .order(pragma_table_xinfo::cid)
+        .select(TableColumn::as_select())
+        .load::<TableColumn>(connection)?;
+    let suffixes = relations
+        .iter()
+        .filter(|relation| relation.schema == database && relation.table_type == "shadow")
+        .filter_map(|relation| relation.name.rsplit_once('_'))
+        .filter(|(prefix, _)| prefix.eq_ignore_ascii_case(name))
+        .map(|(_, suffix)| suffix);
+    Ok(DeclaredVirtualTable::new(
+        columns.into_iter().map(|column| {
+            DeclaredColumn::new(column.name, column.declared_type, column.hidden == 1)
+        }),
+        suffixes,
+    ))
 }
 
 pub(crate) fn internal(name: &str) -> bool {
@@ -159,15 +180,11 @@ fn parse_one(database: &str, name: &str, sql: &str) -> Result<Statement, Dieseli
             source,
         }
     };
-    let mut statements = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(failure)?;
-    if statements.len() != 1 {
-        return Err(failure(ParserError::ParserError(
-            "expected exactly one stored statement".to_owned(),
-        )));
-    }
-    statements
-        .pop()
-        .ok_or_else(|| failure(ParserError::ParserError("missing stored statement".to_owned())))
+    let statements = Parser::parse_sql(&SQLiteDialect {}, sql).map_err(failure)?;
+    let [statement] = <[Statement; 1]>::try_from(statements).map_err(|_| {
+        failure(ParserError::ParserError("expected exactly one stored statement".to_owned()))
+    })?;
+    Ok(statement)
 }
 
 fn qualify(statement: &mut Statement, database: &str) {
@@ -183,4 +200,54 @@ fn qualify(statement: &mut Statement, database: &str) {
         _ => return,
     };
     name.0.insert(0, sqlparser::ast::ObjectNamePart::Identifier(Ident::with_quote('"', database)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_sqlite_before_3_37() {
+        assert!(check_version("3.37.0".to_owned()).is_ok());
+        for version in ["3.36.9", "3.37", "3.37.x"] {
+            assert!(matches!(
+                check_version(version.to_owned()),
+                Err(DieseliteBuildError::UnsupportedSqliteVersion { found }) if found == version
+            ));
+        }
+    }
+
+    fn ingested(sql: &str) -> Result<ParserDBIngestor, DieseliteBuildError> {
+        let mut connection =
+            SqliteConnection::establish(":memory:").expect("in-memory database opens");
+        let input = ParseOptions::default()
+            .with_identifier_case(IdentifierCase::Folded)
+            .ingestor::<SQLiteDialect>("main".to_owned());
+        ingest(input, &mut connection, &[], "main", "t", sql)
+    }
+
+    #[test]
+    fn refuses_an_unparsable_definition() {
+        assert!(matches!(
+            ingested("CREATE TABLE t("),
+            Err(DieseliteBuildError::UnparsableDefinition { name, .. }) if name == "t"
+        ));
+    }
+
+    #[test]
+    fn refuses_a_definition_of_several_statements() {
+        assert!(matches!(
+            ingested("CREATE TABLE t(a); CREATE TABLE u(b)"),
+            Err(DieseliteBuildError::UnparsableDefinition { name, .. }) if name == "t"
+        ));
+    }
+
+    #[test]
+    fn reports_a_definition_the_model_refuses() {
+        assert!(matches!(
+            ingested("CREATE TABLE t(a, a)"),
+            Err(DieseliteBuildError::Ingestion { database, name, .. })
+                if database == "main" && name == "t"
+        ));
+    }
 }

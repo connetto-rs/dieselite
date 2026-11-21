@@ -114,6 +114,20 @@ fn composite_and_implicit_keys() {
 }
 
 #[test]
+fn restricting_and_defaulting_actions() {
+    use sql_traits::prelude::*;
+    let database = build(
+        "CREATE TABLE p(a INT PRIMARY KEY); CREATE TABLE c(a INT DEFAULT 0 REFERENCES p ON UPDATE RESTRICT ON DELETE SET DEFAULT)",
+    ).expect("catalog agrees");
+    let key = database
+        .tables()
+        .find_map(|table| table.foreign_keys(&database).expect("keys").next())
+        .expect("c holds a key");
+    assert_eq!(key.on_update(&database), sqlparser::ast::ReferentialAction::Restrict);
+    assert_eq!(key.on_delete(&database), sqlparser::ast::ReferentialAction::SetDefault);
+}
+
+#[test]
 fn unique_partial_expression_indexes() {
     use sql_traits::prelude::*;
     let database = build(

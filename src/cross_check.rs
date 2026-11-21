@@ -1,5 +1,7 @@
 //! Pure comparisons between pragma rows and the parsed model.
 
+use std::iter::once;
+
 use diesel::prelude::*;
 use sql_traits::{errors::LookupError, prelude::*};
 use sqlparser::ast::Expr;
@@ -38,23 +40,22 @@ pub(crate) fn load(
                 .order((pragma_foreign_key_list::id, pragma_foreign_key_list::seq))
                 .select(ForeignKeyColumn::as_select())
                 .load(connection)?;
-            let indexes = pragma_index_list::table
+            let listed = pragma_index_list::table
                 .filter(pragma_index_list::arg.eq(&relation.name))
                 .filter(pragma_index_list::schema.eq(&relation.schema))
                 .select(IndexListEntry::as_select())
-                .load::<IndexListEntry>(connection)?
-                .into_iter()
-                .map(|index| {
-                    let columns = pragma_index_xinfo::table
-                        .filter(pragma_index_xinfo::arg.eq(&index.name))
-                        .filter(pragma_index_xinfo::schema.eq(&relation.schema))
-                        .filter(pragma_index_xinfo::key.eq(true))
-                        .order(pragma_index_xinfo::seqno)
-                        .select(IndexColumn::as_select())
-                        .load(connection)?;
-                    Ok((index, columns))
-                })
-                .collect::<Result<_, diesel::result::Error>>()?;
+                .load::<IndexListEntry>(connection)?;
+            let mut indexes = Vec::with_capacity(listed.len());
+            for index in listed {
+                let columns = pragma_index_xinfo::table
+                    .filter(pragma_index_xinfo::arg.eq(&index.name))
+                    .filter(pragma_index_xinfo::schema.eq(&relation.schema))
+                    .filter(pragma_index_xinfo::key.eq(true))
+                    .order(pragma_index_xinfo::seqno)
+                    .select(IndexColumn::as_select())
+                    .load(connection)?;
+                indexes.push((index, columns));
+            }
             Ok(CatalogRelation { relation, columns, foreign_keys, indexes })
         })
         .collect()
@@ -149,12 +150,9 @@ pub(crate) fn check(
         let owner = answer(relation, "shadow owner", table.shadow_owner(database))?;
         equal(relation, "shadow owner", relation.table_type == "shadow", owner.is_some())?;
         if relation.table_type == "shadow" {
-            names_equal(
-                relation,
-                "shadow owner",
-                std::iter::once(relation.name.rsplit_once('_').map(|(prefix, _)| prefix)),
-                std::iter::once(owner.map(TableLike::table_name)),
-            )?;
+            let expected = relation.name.rsplit_once('_').map(|(prefix, _)| prefix);
+            let found = owner.map(TableLike::table_name);
+            names_equal(relation, "shadow owner", once(expected), once(found))?;
         }
         check_columns(database, catalog, table)?;
         check_foreign_keys(database, catalog, table)?;
@@ -245,11 +243,16 @@ fn check_foreign_keys(
     table: &<ParserDB as DatabaseLike>::Table,
 ) -> Result<(), DieseliteBuildError> {
     let relation = &catalog.relation;
-    let groups = catalog.foreign_keys.chunk_by(|left, right| left.id == right.id);
+    let same_key = |left: &ForeignKeyColumn, right: &ForeignKeyColumn| left.id == right.id;
     let mut unmatched =
         answer(relation, "foreign key count", table.foreign_keys(database))?.collect::<Vec<_>>();
-    equal(relation, "foreign key count", groups.clone().count(), unmatched.len())?;
-    for group in groups {
+    equal(
+        relation,
+        "foreign key count",
+        catalog.foreign_keys.chunk_by(same_key).count(),
+        unmatched.len(),
+    )?;
+    for group in catalog.foreign_keys.chunk_by(same_key) {
         let mut found = None;
         for (position, key) in unmatched.iter().enumerate() {
             let mut expected = group.iter();
@@ -323,8 +326,8 @@ fn check_foreign_key(
     names_equal(
         relation,
         "foreign key target",
-        std::iter::once(Some(group[0].referenced_table.as_str())),
-        std::iter::once(Some(key.referenced_table_name().name())),
+        once(Some(group[0].referenced_table.as_str())),
+        once(Some(key.referenced_table_name().name())),
     )?;
     equal(
         relation,
@@ -640,4 +643,38 @@ mod tests {
     mismatch_test!(unique_constraint, "CREATE TABLE t(a INT)", "unique constraint", rows, {
         rows.indexes.push(index("u"));
     });
+
+    #[test]
+    fn absent_table() -> Result<(), sql_traits::errors::Error> {
+        let database = ParseOptions::default()
+            .with_identifier_case(IdentifierCase::Folded)
+            .parse::<sqlparser::dialect::SQLiteDialect>("CREATE TABLE t(a INT)")?;
+        let mut missing = catalog();
+        missing.relation.name = "missing".to_owned();
+        let result = check(&database, &[catalog(), missing]);
+        assert!(
+            matches!(
+                &result,
+                Err(DieseliteBuildError::Mismatch { object, fact: "relations", .. })
+                    if object == "missing"
+            ),
+            "{result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extra_model_column() -> Result<(), sql_traits::errors::Error> {
+        rejects("CREATE TABLE t(a INT, b INT)", catalog(), "column names")
+    }
+
+    mismatch_test!(
+        absent_named_index,
+        "CREATE TABLE t(a INT); CREATE INDEX other ON t(a)",
+        "index names",
+        rows,
+        {
+            rows.indexes.push(index("c"));
+        }
+    );
 }
