@@ -137,6 +137,13 @@ fn unique_partial_expression_indexes() {
 }
 
 #[test]
+fn shared_and_collated_index_entries() {
+    build(
+        "CREATE TABLE t(a TEXT COLLATE nocase, b INT, c TEXT, UNIQUE(a DESC), PRIMARY KEY(a), UNIQUE(a COLLATE NOCASE), UNIQUE(c COLLATE RTRIM, b)) WITHOUT ROWID; CREATE INDEX e ON t(lower(a) COLLATE RTRIM, b DESC); CREATE TABLE r(x INT PRIMARY KEY, y TEXT UNIQUE); CREATE INDEX ry ON r(y COLLATE NOCASE)",
+    ).expect("catalog agrees");
+}
+
+#[test]
 fn views_and_triggers() {
     use sql_traits::prelude::*;
     let database = build(
