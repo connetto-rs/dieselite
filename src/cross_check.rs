@@ -4,7 +4,7 @@ use std::iter::once;
 
 use diesel::prelude::*;
 use sql_traits::{errors::LookupError, prelude::*};
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, GeneratedExpressionMode};
 
 use crate::{
     DieseliteBuildError,
@@ -154,6 +154,8 @@ pub(crate) fn check(
             let found = owner.map(TableLike::table_name);
             names_equal(relation, "shadow owner", once(expected), once(found))?;
         }
+        equal(relation, "strict", relation.strict, table.is_strict())?;
+        equal(relation, "without rowid", relation.wr, table.is_without_rowid())?;
         check_columns(database, catalog, table)?;
         check_foreign_keys(database, catalog, table)?;
         check_indexes(database, catalog, table)?;
@@ -207,8 +209,12 @@ fn check_columns(
         equal(
             relation,
             "generated",
-            matches!(catalog_column.hidden, 2 | 3),
-            column.generation_expression().is_some(),
+            match catalog_column.hidden {
+                2 => Some(GeneratedExpressionMode::Virtual),
+                3 => Some(GeneratedExpressionMode::Stored),
+                _ => None,
+            },
+            column.generation_storage(database),
         )?;
     }
     Ok(())
@@ -541,6 +547,16 @@ mod tests {
         rows.columns[0].hidden = 1;
     });
     mismatch_test!(generated, "CREATE TABLE t(a INT)", "generated", rows, {
+        rows.columns[0].hidden = 2;
+    });
+    mismatch_test!(strict, "CREATE TABLE t(a INT)", "strict", rows, {
+        rows.relation.strict = true;
+    });
+    mismatch_test!(without_rowid, "CREATE TABLE t(a INT PRIMARY KEY)", "without rowid", rows, {
+        rows.relation.wr = true;
+        rows.columns[0].pk = 1;
+    });
+    mismatch_test!(generation_storage, "CREATE TABLE t(a INT AS (1) STORED)", "generated", rows, {
         rows.columns[0].hidden = 2;
     });
     mismatch_test!(foreign_key_count, "CREATE TABLE t(a INT)", "foreign key count", rows, {
