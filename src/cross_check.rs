@@ -298,16 +298,19 @@ fn matches_foreign_key(
     {
         return false;
     }
-    if group.iter().all(|column| column.to.is_none()) {
-        return true;
-    }
-    let Ok(mut columns) = key.referenced_columns(database) else { return true };
-    let mut expected = group.iter();
-    columns.all(|column| {
-        expected
-            .next()
-            .and_then(|expected| expected.to.as_deref())
-            .is_some_and(|expected| expected.eq_ignore_ascii_case(column.column_name()))
+    written_columns_agree(group, key)
+}
+
+/// Returns whether the referenced columns SQLite reports for `group` are the
+/// ones `key` names as written. SQLite reports `to` for every column or for
+/// none, the latter when the key names its target's primary key implicitly.
+fn written_columns_agree(
+    group: &[ForeignKeyColumn],
+    key: &<ParserDB as DatabaseLike>::ForeignKey,
+) -> bool {
+    let mut expected = group.iter().filter_map(|column| column.to.as_deref());
+    key.referenced_column_names().all(|(name, _)| {
+        expected.next().is_some_and(|expected| expected.eq_ignore_ascii_case(name))
     }) && expected.next().is_none()
 }
 
@@ -335,45 +338,12 @@ fn check_foreign_key(
         group[0].on_delete.as_str(),
         action_name(key.on_delete(database)),
     )?;
-    let referenced = key
-        .referenced_columns(database)
-        .map_err(|source| {
-            DieseliteBuildError::ForeignKeyLookup {
-                database: relation.schema.clone(),
-                table: relation.name.clone(),
-                id: group[0].id,
-                source,
-            }
-        })?
-        .map(|column| Some(column.column_name()));
-    if group.iter().all(|column| column.to.is_none()) {
-        let parent = key.referenced_table(database).map_err(|source| {
-            DieseliteBuildError::ForeignKeyLookup {
-                database: relation.schema.clone(),
-                table: relation.name.clone(),
-                id: group[0].id,
-                source,
-            }
-        })?;
-        names_equal(
-            relation,
-            "foreign key referenced columns",
-            answer(
-                relation,
-                "foreign key referenced columns",
-                parent.primary_key_columns(database),
-            )?
-            .map(|column| Some(column.column_name())),
-            referenced,
-        )
-    } else {
-        names_equal(
-            relation,
-            "foreign key referenced columns",
-            group.iter().map(|column| column.to.as_deref()),
-            referenced,
-        )
-    }
+    names_equal(
+        relation,
+        "foreign key referenced columns",
+        group.iter().filter_map(|column| column.to.as_deref()).map(Some),
+        key.referenced_column_names().map(|(name, _)| Some(name)),
+    )
 }
 
 fn column_expression(expression: &Expr) -> Option<&str> {

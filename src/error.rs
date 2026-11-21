@@ -39,19 +39,6 @@ pub enum DieseliteBuildError {
         #[source]
         source: Box<sql_traits::errors::Error>,
     },
-    /// A foreign key's target could not be read from the model.
-    #[error("cannot resolve foreign key {id} on {database}.{table}")]
-    ForeignKeyLookup {
-        /// Database holding the referencing table.
-        database: String,
-        /// Referencing table.
-        table: String,
-        /// SQLite's foreign key identifier.
-        id: i32,
-        /// Target lookup failure.
-        #[source]
-        source: sql_traits::errors::LookupError,
-    },
     /// SQLite's catalog disagrees with the model.
     #[error("{database}.{object} disagrees on {fact} ({catalog} versus {model})")]
     Mismatch {
