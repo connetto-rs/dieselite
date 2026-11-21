@@ -14,6 +14,16 @@ categories = ["database"]
 [dependencies]
 diesel = { version = "2.4", default-features = false, features = ["sqlite"] }
 serde = { version = "1", features = ["derive"], optional = true }
+sql-traits = { git = "https://github.com/connetto-rs/sql-traits", branch = "main" }
+sqlparser = { version = "0.64", features = ["visitor"] }
+diesel-dynamic-schema = { version = "0.3", features = ["sqlite"] }
+thiserror = "2"
+
+# These patches track upstream main for this crate's own builds.
+[patch.crates-io]
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+diesel = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
+diesel-dynamic-schema = { git = "https://github.com/diesel-rs/diesel", branch = "main" }
 
 [dev-dependencies]
 libsqlite3-sys = { version = "0.40", features = ["bundled"] }

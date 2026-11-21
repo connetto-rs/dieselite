@@ -33,4 +33,17 @@ assert!(columns[1].1.notnull);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+Build a checked `ParserDB` from a connection's stored definitions.
+
+```rust
+use diesel::{Connection, SqliteConnection};
+use dieselite::{DieseliteDatabaseBuilder, sql_traits::prelude::ParserDB};
+
+let mut connection = SqliteConnection::establish(":memory:").expect("connection");
+let database: ParserDB = DieseliteDatabaseBuilder::default()
+    .connection(&mut connection)
+    .try_into()?;
+# Ok::<(), dieselite::DieseliteBuildError>(())
+```
+
 The `serde` feature, on by default, derives `Serialize` and `Deserialize` on the models. The pragma tables need SQLite 3.37 or later.
