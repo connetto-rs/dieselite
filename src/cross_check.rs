@@ -4,7 +4,7 @@ use std::iter::once;
 
 use diesel::prelude::*;
 use sql_traits::{errors::LookupError, prelude::*};
-use sqlparser::ast::Expr;
+use sqlparser::ast::GeneratedExpressionMode;
 
 use crate::{
     DieseliteBuildError,
@@ -50,7 +50,6 @@ pub(crate) fn load(
                 let columns = pragma_index_xinfo::table
                     .filter(pragma_index_xinfo::arg.eq(&index.name))
                     .filter(pragma_index_xinfo::schema.eq(&relation.schema))
-                    .filter(pragma_index_xinfo::key.eq(true))
                     .order(pragma_index_xinfo::seqno)
                     .select(IndexColumn::as_select())
                     .load(connection)?;
@@ -149,11 +148,13 @@ pub(crate) fn check(
         )?;
         let owner = answer(relation, "shadow owner", table.shadow_owner(database))?;
         equal(relation, "shadow owner", relation.table_type == "shadow", owner.is_some())?;
-        if relation.table_type == "shadow" {
-            let expected = relation.name.rsplit_once('_').map(|(prefix, _)| prefix);
-            let found = owner.map(TableLike::table_name);
-            names_equal(relation, "shadow owner", once(expected), once(found))?;
+        if let Some(owner) = owner {
+            let expected =
+                relation.name.rsplit_once('_').map_or(relation.name.as_str(), |(prefix, _)| prefix);
+            names_equal(relation, "shadow owner", once(expected), once(owner.table_name()))?;
         }
+        equal(relation, "strict", relation.strict, table.is_strict())?;
+        equal(relation, "without rowid", relation.wr, table.is_without_rowid())?;
         check_columns(database, catalog, table)?;
         check_foreign_keys(database, catalog, table)?;
         check_indexes(database, catalog, table)?;
@@ -171,17 +172,17 @@ fn check_columns(
     names_equal(
         relation,
         "column names",
-        catalog.columns.iter().map(|column| Some(column.name.as_str())),
-        columns.map(|column| Some(column.column_name())),
+        catalog.columns.iter().map(|column| column.name.as_str()),
+        columns.map(ColumnLike::column_name),
     )?;
     let mut primary = catalog.columns.iter().filter(|column| column.pk > 0).collect::<Vec<_>>();
     primary.sort_by_key(|column| column.pk);
     names_equal(
         relation,
         "primary key",
-        primary.iter().map(|column| Some(column.name.as_str())),
+        primary.iter().map(|column| column.name.as_str()),
         answer(relation, "primary key", table.primary_key_columns(database))?
-            .map(|column| Some(column.column_name())),
+            .map(ColumnLike::column_name),
     )?;
     let rowid_alias = !relation.wr
         && relation.table_type != "virtual"
@@ -207,8 +208,18 @@ fn check_columns(
         equal(
             relation,
             "generated",
-            matches!(catalog_column.hidden, 2 | 3),
-            column.generation_expression().is_some(),
+            match catalog_column.hidden {
+                2 => Some(GeneratedExpressionMode::Virtual),
+                3 => Some(GeneratedExpressionMode::Stored),
+                _ => None,
+            },
+            column.generation_storage(database),
+        )?;
+        equal(
+            relation,
+            "declared type",
+            Some(catalog_column.declared_type.as_str()),
+            answer(relation, "declared type", column.declared_type_text(database))?,
         )?;
     }
     Ok(())
@@ -217,17 +228,12 @@ fn check_columns(
 fn names_equal<'catalog, 'model>(
     relation: &TableListEntry,
     fact: &'static str,
-    catalog: impl Iterator<Item = Option<&'catalog str>>,
-    mut model: impl Iterator<Item = Option<&'model str>>,
+    catalog: impl Iterator<Item = &'catalog str>,
+    mut model: impl Iterator<Item = &'model str>,
 ) -> Result<(), DieseliteBuildError> {
     for expected in catalog {
         let actual = model.next();
-        let agrees = match (expected, actual) {
-            (Some(expected), Some(Some(actual))) => expected.eq_ignore_ascii_case(actual),
-            (None, Some(None)) => true,
-            _ => false,
-        };
-        if !agrees {
+        if !actual.is_some_and(|actual| expected.eq_ignore_ascii_case(actual)) {
             return Err(mismatch(relation, fact, expected, actual));
         }
     }
@@ -326,8 +332,8 @@ fn check_foreign_key(
     names_equal(
         relation,
         "foreign key target",
-        once(Some(group[0].referenced_table.as_str())),
-        once(Some(key.referenced_table_name().name())),
+        once(group[0].referenced_table.as_str()),
+        once(key.referenced_table_name().name()),
     )?;
     equal(
         relation,
@@ -344,17 +350,49 @@ fn check_foreign_key(
     names_equal(
         relation,
         "foreign key referenced columns",
-        group.iter().filter_map(|column| column.to.as_deref()).map(Some),
-        key.referenced_column_names().map(|(name, _)| Some(name)),
+        group.iter().filter_map(|column| column.to.as_deref()),
+        key.referenced_column_names().map(|(name, _)| name),
     )
 }
 
-fn column_expression(expression: &Expr) -> Option<&str> {
-    match expression {
-        Expr::Identifier(identifier) => Some(identifier.value.as_str()),
-        Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => column_expression(inner),
-        _ => None,
-    }
+/// One `pragma_index_xinfo` row as compared: the column name folded to lower
+/// case, the `cid` SQLite gives the rowid (`-1`) and an expression (`-2`) or
+/// `0` for a column, the direction, the collation, and whether it is a key.
+type Entry = (Option<String>, i32, bool, String, bool);
+
+fn catalog_entries(columns: &[IndexColumn]) -> Vec<Entry> {
+    columns
+        .iter()
+        .map(|column| {
+            (
+                column.name.as_deref().map(str::to_lowercase),
+                column.cid.min(0),
+                column.desc,
+                column.coll.clone(),
+                column.key,
+            )
+        })
+        .collect()
+}
+
+fn model_entries<I: TableIndexLike<DB = ParserDB>>(
+    relation: &TableListEntry,
+    index: &I,
+    database: &ParserDB,
+) -> Result<Vec<Entry>, DieseliteBuildError> {
+    let entries = answer(relation, "index columns", index.sqlite_index_columns(database))?;
+    Ok(entries
+        .into_iter()
+        .flatten()
+        .map(|entry| {
+            let (name, cid) = match entry.indexed() {
+                SqliteIndexed::Column(column) => (Some(column.column_name().to_lowercase()), 0),
+                SqliteIndexed::Rowid => (None, -1),
+                SqliteIndexed::Expression(_) => (None, -2),
+            };
+            (name, cid, entry.is_descending(), entry.collation().to_owned(), entry.is_key())
+        })
+        .collect())
 }
 
 fn check_indexes(
@@ -370,8 +408,10 @@ fn check_indexes(
         catalog.indexes.iter().filter(|(index, _)| index.origin == "c").count(),
         indexes.len(),
     )?;
+    let constraints =
+        answer(relation, "unique constraint", table.unique_indices(database))?.collect::<Vec<_>>();
     for (index, columns) in &catalog.indexes {
-        let expected = columns.iter().map(|column| column.name.as_deref());
+        let expected = catalog_entries(columns);
         if index.origin == "c" {
             let model = indexes
                 .iter()
@@ -381,39 +421,37 @@ fn check_indexes(
                 .ok_or_else(|| mismatch(relation, "index names", &index.name, "absent"))?;
             equal(relation, "index uniqueness", index.unique, model.is_unique())?;
             equal(relation, "index partiality", index.partial, model.predicate().is_some())?;
-            names_equal(
-                relation,
-                "index columns",
-                expected,
-                answer(relation, "index columns", model.keys(database))?
-                    .map(|key| column_expression(key.expression())),
-            )?;
-        } else if index.origin == "pk" {
-            names_equal(
-                relation,
-                "primary key index",
-                expected,
-                answer(relation, "primary key index", table.primary_key_columns(database))?
-                    .map(|column| Some(column.column_name())),
-            )?;
-        } else {
-            let mut found = false;
-            for unique in answer(relation, "unique constraint", table.unique_indices(database))? {
-                let mut expected = expected.clone();
-                let agrees = answer(relation, "unique constraint", unique.columns(database))?.all(
-                    |column| {
-                        expected
-                            .next()
-                            .flatten()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(column.column_name()))
-                    },
-                ) && expected.next().is_none();
-                if agrees {
-                    found = true;
-                    break;
-                }
+            equal(relation, "index columns", expected, model_entries(relation, *model, database)?)?;
+            continue;
+        }
+        let fact = if index.origin == "pk" { "primary key index" } else { "unique constraint" };
+        let mut backed = false;
+        for constraint in &constraints {
+            let name = answer(relation, fact, constraint.backing_index_name(database))?;
+            if name.is_some_and(|name| name.eq_ignore_ascii_case(&index.name)) {
+                backed = true;
+                equal(
+                    relation,
+                    "index columns",
+                    &expected,
+                    &model_entries(relation, *constraint, database)?,
+                )?;
             }
-            equal(relation, "unique constraint", true, found)?;
+        }
+        equal(relation, fact, true, backed)?;
+    }
+    for constraint in &constraints {
+        if let Some(name) =
+            answer(relation, "unique constraint", constraint.backing_index_name(database))?
+        {
+            equal(
+                relation,
+                "unique constraint",
+                true,
+                catalog.indexes.iter().any(|(index, _)| {
+                    index.origin != "c" && index.name.eq_ignore_ascii_case(&name)
+                }),
+            )?;
         }
     }
     Ok(())
@@ -543,6 +581,19 @@ mod tests {
     mismatch_test!(generated, "CREATE TABLE t(a INT)", "generated", rows, {
         rows.columns[0].hidden = 2;
     });
+    mismatch_test!(strict, "CREATE TABLE t(a INT)", "strict", rows, {
+        rows.relation.strict = true;
+    });
+    mismatch_test!(without_rowid, "CREATE TABLE t(a INT PRIMARY KEY)", "without rowid", rows, {
+        rows.relation.wr = true;
+        rows.columns[0].pk = 1;
+    });
+    mismatch_test!(generation_storage, "CREATE TABLE t(a INT AS (1) STORED)", "generated", rows, {
+        rows.columns[0].hidden = 2;
+    });
+    mismatch_test!(declared_type, "CREATE TABLE t(a INT)", "declared type", rows, {
+        rows.columns[0].declared_type = "TEXT".to_owned();
+    });
     mismatch_test!(foreign_key_count, "CREATE TABLE t(a INT)", "foreign key count", rows, {
         rows.foreign_keys.push(foreign_key());
     });
@@ -643,6 +694,34 @@ mod tests {
     mismatch_test!(unique_constraint, "CREATE TABLE t(a INT)", "unique constraint", rows, {
         rows.indexes.push(index("u"));
     });
+    mismatch_test!(
+        index_auxiliary_entries,
+        "CREATE TABLE t(a INT); CREATE INDEX idx ON t(a)",
+        "index columns",
+        rows,
+        {
+            rows.indexes.push(index("c"));
+        }
+    );
+    mismatch_test!(
+        backing_index_name,
+        "CREATE TABLE t(a INT UNIQUE)",
+        "unique constraint",
+        rows,
+        {
+            rows.indexes.push(index("u"));
+        }
+    );
+    mismatch_test!(backing_index_entries, "CREATE TABLE t(a INT UNIQUE)", "index columns", rows, {
+        let mut backing = index("u");
+        backing.0.name = "sqlite_autoindex_t_1".to_owned();
+        rows.indexes.push(backing);
+    });
+
+    #[test]
+    fn unlisted_backing_index() -> Result<(), sql_traits::errors::Error> {
+        rejects("CREATE TABLE t(a INT UNIQUE)", catalog(), "unique constraint")
+    }
 
     #[test]
     fn absent_table() -> Result<(), sql_traits::errors::Error> {

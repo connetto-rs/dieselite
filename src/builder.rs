@@ -64,7 +64,7 @@ impl TryFrom<DieseliteDatabaseBuilder<'_>> for ParserDB {
                 database.file.replace('\'', "''"),
                 database.name.replace('"', "\"\"")
             );
-            input = ingest(input, connection, &relations, &database.name, &database.name, &sql)?;
+            input = applied(input.apply_sql(&sql), &database.name, &database.name, &sql)?;
         }
         for database in databases
             .iter()
@@ -110,10 +110,9 @@ fn check_version(version: String) -> Result<(), DieseliteBuildError> {
     }
 }
 
-/// Parses the stored definition `sql` of `name` in `database`, names the
-/// object it creates under `database`, and applies it to `input`. A virtual
-/// table goes in with the columns and shadow tables `connection` reports for
-/// it.
+/// Applies the stored definition `sql` of `name` to `input` under
+/// `database`, which SQLite stores unqualified. A virtual table goes in with
+/// the columns and shadow tables `connection` reports for it.
 fn ingest(
     input: ParserDBIngestor,
     connection: &mut SqliteConnection,
@@ -122,19 +121,52 @@ fn ingest(
     name: &str,
     sql: &str,
 ) -> Result<ParserDBIngestor, DieseliteBuildError> {
-    let mut statement = parse_one(database, name, sql)?;
-    qualify(&mut statement, database);
-    let applied = if matches!(statement, Statement::CreateVirtualTable { .. }) {
+    let virtual_table = relations.iter().any(|relation| {
+        relation.table_type == "virtual"
+            && relation.schema == database
+            && relation.name.eq_ignore_ascii_case(name)
+    });
+    let result = if virtual_table {
+        let mut statement = parse_one(database, name, sql)?;
+        if let Statement::CreateVirtualTable { name: created, .. } = &mut statement {
+            created.0.insert(
+                0,
+                sqlparser::ast::ObjectNamePart::Identifier(Ident::with_quote('"', database)),
+            );
+        }
         let declared = declared_virtual_table(connection, relations, database, name)?;
         input.apply_virtual_table(statement, declared)
     } else {
-        input.apply_statement(statement)
+        input.apply_sql_in(&Ident::with_quote('"', database), sql)
     };
-    applied.map_err(|source| {
-        DieseliteBuildError::Ingestion {
-            database: database.to_owned(),
-            name: name.to_owned(),
-            source: Box::new(source),
+    applied(result, database, name, sql)
+}
+
+/// Names the object `name` of `database` in an ingestion failure, and reports
+/// its definition `sql` when it does not parse.
+fn applied(
+    result: Result<ParserDBIngestor, sql_traits::errors::Error>,
+    database: &str,
+    name: &str,
+    sql: &str,
+) -> Result<ParserDBIngestor, DieseliteBuildError> {
+    result.map_err(|source| {
+        match source {
+            sql_traits::errors::Error::SqlParserError { error, .. } => {
+                DieseliteBuildError::UnparsableDefinition {
+                    database: database.to_owned(),
+                    name: name.to_owned(),
+                    sql: sql.to_owned(),
+                    source: error,
+                }
+            }
+            source => {
+                DieseliteBuildError::Ingestion {
+                    database: database.to_owned(),
+                    name: name.to_owned(),
+                    source: Box::new(source),
+                }
+            }
         }
     })
 }
@@ -187,21 +219,6 @@ fn parse_one(database: &str, name: &str, sql: &str) -> Result<Statement, Dieseli
     Ok(statement)
 }
 
-fn qualify(statement: &mut Statement, database: &str) {
-    let name = match statement {
-        Statement::CreateTable(table) => &mut table.name,
-        Statement::CreateIndex(index) => {
-            let Some(name) = &mut index.name else { return };
-            name
-        }
-        Statement::CreateView(view) => &mut view.name,
-        Statement::CreateTrigger(trigger) => &mut trigger.name,
-        Statement::CreateVirtualTable { name, .. } => name,
-        _ => return,
-    };
-    name.0.insert(0, sqlparser::ast::ObjectNamePart::Identifier(Ident::with_quote('"', database)));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,35 +234,58 @@ mod tests {
         }
     }
 
-    fn ingested(sql: &str) -> Result<ParserDBIngestor, DieseliteBuildError> {
+    fn ingested(
+        relations: &[TableListEntry],
+        sql: &str,
+    ) -> Result<ParserDBIngestor, DieseliteBuildError> {
         let mut connection =
             SqliteConnection::establish(":memory:").expect("in-memory database opens");
         let input = ParseOptions::default()
             .with_identifier_case(IdentifierCase::Folded)
             .ingestor::<SQLiteDialect>("main".to_owned());
-        ingest(input, &mut connection, &[], "main", "t", sql)
+        ingest(input, &mut connection, relations, "main", "t", sql)
     }
 
     #[test]
     fn refuses_an_unparsable_definition() {
         assert!(matches!(
-            ingested("CREATE TABLE t("),
+            ingested(&[], "CREATE TABLE t("),
+            Err(DieseliteBuildError::UnparsableDefinition { name, sql, .. })
+                if name == "t" && sql == "CREATE TABLE t("
+        ));
+    }
+
+    fn virtual_table() -> TableListEntry {
+        TableListEntry {
+            schema: "main".to_owned(),
+            name: "t".to_owned(),
+            table_type: "virtual".to_owned(),
+            ncol: 1,
+            wr: false,
+            strict: false,
+        }
+    }
+
+    #[test]
+    fn refuses_a_virtual_definition_of_several_statements() {
+        assert!(matches!(
+            ingested(&[virtual_table()], "CREATE VIRTUAL TABLE t USING fts5(a); CREATE TABLE u(b)"),
             Err(DieseliteBuildError::UnparsableDefinition { name, .. }) if name == "t"
         ));
     }
 
     #[test]
-    fn refuses_a_definition_of_several_statements() {
+    fn refuses_a_virtual_table_stored_as_a_plain_table() {
         assert!(matches!(
-            ingested("CREATE TABLE t(a); CREATE TABLE u(b)"),
-            Err(DieseliteBuildError::UnparsableDefinition { name, .. }) if name == "t"
+            ingested(&[virtual_table()], "CREATE TABLE t(a)"),
+            Err(DieseliteBuildError::Ingestion { name, .. }) if name == "t"
         ));
     }
 
     #[test]
     fn reports_a_definition_the_model_refuses() {
         assert!(matches!(
-            ingested("CREATE TABLE t(a, a)"),
+            ingested(&[], "CREATE TABLE t(a, a)"),
             Err(DieseliteBuildError::Ingestion { database, name, .. })
                 if database == "main" && name == "t"
         ));

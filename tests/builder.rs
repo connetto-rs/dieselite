@@ -137,6 +137,13 @@ fn unique_partial_expression_indexes() {
 }
 
 #[test]
+fn shared_and_collated_index_entries() {
+    build(
+        "CREATE TABLE t(a TEXT COLLATE nocase, b INT, c TEXT, UNIQUE(a DESC), PRIMARY KEY(a), UNIQUE(a COLLATE NOCASE), UNIQUE(c COLLATE RTRIM, b)) WITHOUT ROWID; CREATE INDEX e ON t(lower(a) COLLATE RTRIM, b DESC); CREATE TABLE r(x INT PRIMARY KEY, y TEXT UNIQUE); CREATE INDEX ry ON r(y COLLATE NOCASE)",
+    ).expect("catalog agrees");
+}
+
+#[test]
 fn views_and_triggers() {
     use sql_traits::prelude::*;
     let database = build(
@@ -173,6 +180,13 @@ fn attached_and_temp_databases() {
     ).expect("catalog agrees");
     assert_eq!(database.tables().count(), 4);
     assert_eq!(database.views().count(), 1);
+}
+
+#[test]
+fn declared_types_in_every_database() {
+    build(
+        "CREATE TABLE t(a int, b VARCHAR( 10 ), c \"my  Type\", d, e int(+5, 2)); ATTACH ':memory:' AS other; CREATE TABLE other.p(id integer, label nvarchar(+5)); CREATE TEMP TABLE temp_table(a Decimal(10, 2), b /* note */ TEXT); CREATE VIRTUAL TABLE docs USING fts5(body)",
+    ).expect("catalog agrees");
 }
 
 #[test]
